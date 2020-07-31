@@ -1,0 +1,180 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Image Builder Pipeline for cdkworkshop.com AMI
+
+Parameters:
+  Prefix:
+    Default: cdk-workshop
+    Description: Prefix for the Pipeline, Image, etc.
+    Type: String
+    AllowedPattern: ^[-_A-Za-z-0-9][-_A-Za-z0-9 ]{1,100}[-_A-Za-z-0-9]$
+  BaseImage:
+    Default: windows-server-2019-english-full-base-x86
+    Description: Which Image Builder parent image to use.
+    Type: String
+
+Resources:
+  RootRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder"
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+  IamInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref RootRole
+
+  ImagePipelineParameters:
+    Type: "AWS::ImageBuilder::ImagePipeline"
+    Properties:
+      Name: !Sub ${Prefix}-pipeline
+      ImageRecipeArn: !Ref Recipe
+      InfrastructureConfigurationArn: !Ref InfraConfig
+      DistributionConfigurationArn: !Ref DistConfig
+      Schedule:
+        ScheduleExpression: "cron(0 9 * * *)"
+        PipelineExecutionStartCondition: "EXPRESSION_MATCH_AND_DEPENDENCY_UPDATES_AVAILABLE"
+      Status: "ENABLED"
+
+  InfraConfig:
+    Type: "AWS::ImageBuilder::InfrastructureConfiguration"
+    Properties:
+      Name: !Sub ${Prefix}-infra-config
+      InstanceProfileName: !Ref IamInstanceProfile
+      InstanceTypes:
+        - "c5.large"
+      TerminateInstanceOnFailure: true
+
+  Recipe:
+    Type: "AWS::ImageBuilder::ImageRecipe"
+    Properties:
+      Name: !Sub ${Prefix}-recipe
+      Version: "1.0.7"
+      ParentImage: !Sub "arn:aws:imagebuilder:${AWS::Region}:aws:image/${BaseImage}/x.x.x"
+      Components:
+        - ComponentArn: !Join
+            - ""
+            - - !Sub arn:aws:imagebuilder:${AWS::Region}:${AWS::AccountId}:component/
+              - !Select [1, !Split ["/", !Ref Component]]
+              - /x.x.x
+
+  DistConfig:
+    Type: AWS::ImageBuilder::DistributionConfiguration
+    Properties:
+      Name: !Sub ${Prefix}-distribution
+      Distributions:
+        - AmiDistributionConfiguration:
+            Name: !Sub "${Prefix} - {{ imagebuilder:buildDate }}"
+            amiTags:
+              auto-delete: "no"
+            LaunchPermissionConfiguration:
+              UserGroups:
+                - "all"
+          Region: !Sub ${AWS::Region}
+
+  Component:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: !Sub ${Prefix}-component
+      Platform: Windows
+      Version: 1.2.2
+      Data: |
+        name: WorkShopAMI
+        description: Install dependencies for CDK workshop on Windows AMI
+        schemaVersion: "1.0"
+        phases:
+        - name: build
+          steps:
+          - name: setscript
+            action: ExecutePowerShell
+            timeoutSeconds: 60
+            maxAttempts: 3
+            inputs:
+              commands:
+              - |-
+                @'
+                $sep = [IO.Path]::PathSeparator
+                $env:PATH = '{0}{1}{2}' -f [System.Environment]::GetEnvironmentVariable('Path', 'User'), $sep, [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
+                $res = @(Join-Path $env:ProgramData 'chocolatey';
+                    Join-Path $env:APPDATA 'npm';
+                    Join-Path $env:ProgramFiles 'nodejs';
+                    Join-Path $env:ProgramFiles 'Amazon\AWSCLI\bin';
+                    $env:PATH) -split $sep | ForEach-Object { $_.trimend('\') } | Where-Object { $_ } | Sort-Object -Unique
+                $env:PATH = $res -join $sep
+                [System.Environment]::SetEnvironmentVariable('PATH', $env:PATH, [System.EnvironmentVariableTarget]::Machine)
+                '@ | Out-File 'C:\Windows\system32\updatepath.ps1'
+          - name: createuser
+            action: ExecutePowerShell
+            timeoutSeconds: 60
+            maxAttempts: 3
+            inputs:
+              commands:
+              - |-
+                New-LocalUser -AccountNeverExpires -Description 'WorkshopUser' -Name 'cdk' -Password (ConvertTo-SecureString -String 'Workshop2020!' -AsPlainText -Force)
+                Add-LocalGroupMember -Group 'administrators' -Member 'cdk'
+                Set-LocalUser -Name "cdk" -PasswordNeverExpires 1
+          - name: installchoco
+            action: ExecutePowerShell
+            timeoutSeconds: 60
+            maxAttempts: 3
+            inputs:
+              commands:
+              - |-
+                [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
+                updatepath
+                [Environment]::SetEnvironmentVariable('PATH', $env:path, [EnvironmentVariableTarget]::Machine)
+                [Environment]::SetEnvironmentVariable('ChocolateyInstall', $chocopath, [EnvironmentVariableTarget]::Machine)
+          - name: install-awscli
+            action: ExecutePowerShell
+            timeoutSeconds: 60
+            maxAttempts: 3
+            inputs:
+              commands:
+              - |-
+                $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+                choco install -y awscli
+          - name: install-firefox
+            action: ExecutePowerShell
+            timeoutSeconds: 60
+            maxAttempts: 3
+            inputs:
+              commands:
+              - |-
+                $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+                choco install -y firefox
+          - name: install-vscode
+            action: ExecutePowerShell
+            timeoutSeconds: 60
+            maxAttempts: 3
+            inputs:
+              commands:
+              - |-
+                $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+                choco install -y vscode
+          - name: stagecdkinstall
+            action: ExecutePowerShell
+            timeoutSeconds: 60
+            maxAttempts: 3
+            inputs:
+              commands:
+              - |-
+                @'
+                updatepath
+                choco install nodejs -y
+                npm i -g aws-cdk
+                cdk --version
+                '@ | Out-File 'C:\Windows\system32\installcdk.ps1'
